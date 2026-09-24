@@ -4,42 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Minimal P2P Chat</title>
-<script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js">
-  // パニックキー: 右矢印キーで画面を白くし、もう一度押すと復帰
-  let panicMode = false;
-  let panicAudioStates = [];
-
-  function togglePanicMode() {
-    panicMode = !panicMode;
-    document.body.classList.toggle('panic-mode', panicMode);
-    document.getElementById('panic-screen').setAttribute('aria-hidden', String(!panicMode));
-
-    if (panicMode) {
-      panicAudioStates = [];
-      document.querySelectorAll('audio, video').forEach(media => {
-        panicAudioStates.push({ media, wasPaused: media.paused });
-        try { media.pause(); } catch (_) {}
-      });
-      document.title = 'New Tab';
-    } else {
-      panicAudioStates.forEach(item => {
-        if (!item.wasPaused) item.media.play().catch(() => {});
-      });
-      panicAudioStates = [];
-      document.title = 'Minimal P2P Chat';
-      const input = document.getElementById('msg-input');
-      if (input && document.getElementById('chat-ui').style.display !== 'none') input.focus();
-    }
-  }
-
-  window.addEventListener('keydown', event => {
-    if (event.key !== 'ArrowRight' || event.repeat || event.altKey || event.ctrlKey || event.metaKey) return;
-    event.preventDefault();
-    event.stopPropagation();
-    togglePanicMode();
-  }, true);
-
-</script>
+<script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
 <style>
   body { margin: 0; height: 100vh; overflow: hidden; color: white; font-family: sans-serif; transition: background 0.5s; background: #000; }
   
@@ -313,6 +278,11 @@
   let peer, connections = [], myName, roomID, isHost = false;
   let roomState = { messages: [], users: {} };
   const HISTORY_LIMIT = 20;
+  const JOURNAL_LIMIT = 200;
+  let messageJournal = [];
+  let hostSequence = 0;
+  let activeHostLinkToken = 0;
+  let chatReady = false;
   let seenMessageIds = new Set();
   let hostID = '';
   let hostConnection = null;
@@ -338,16 +308,41 @@
 
   function storageKey() { return 'minimal-p2p-chat:' + roomID; }
 
+  function messageOrderValue(m) {
+    if (Number.isFinite(m.hostSeq)) return m.hostSeq * 10000000000000;
+    if (Number.isFinite(m.receivedAt)) return m.receivedAt;
+    return Number(m.time || 0);
+  }
+
+  function normalizeMessage(m) {
+    if (!isValidMessage(m)) return null;
+    return {...m, receivedAt:Number(m.receivedAt || m.time || Date.now())};
+  }
+
+  function mergeMessages(...groups) {
+    const byId = new Map();
+    groups.flat().forEach(raw => {
+      const m=normalizeMessage(raw); if(!m) return;
+      const prev=byId.get(m.id);
+      if(!prev || (Number.isFinite(m.hostSeq) && !Number.isFinite(prev.hostSeq)) ||
+        Number(m.receivedAt||0) > Number(prev.receivedAt||0)) byId.set(m.id,m);
+    });
+    return [...byId.values()].sort((a,b) => messageOrderValue(a)-messageOrderValue(b) || a.id.localeCompare(b.id));
+  }
+
   function safeLoadHistory() {
     try {
       const saved = JSON.parse(localStorage.getItem(storageKey()) || '[]');
-      return Array.isArray(saved) ? saved.filter(isValidMessage).slice(-HISTORY_LIMIT) : [];
-    } catch (e) { console.warn('履歴の読み込みに失敗:', e); return []; }
+      messageJournal = Array.isArray(saved) ? mergeMessages(saved).slice(-JOURNAL_LIMIT) : [];
+      return messageJournal.slice(-HISTORY_LIMIT);
+    } catch (e) { console.warn('履歴の読み込みに失敗:', e); messageJournal=[]; return []; }
   }
 
   function saveHistory() {
-    try { localStorage.setItem(storageKey(), JSON.stringify(roomState.messages.slice(-HISTORY_LIMIT))); }
-    catch (e) { console.warn('履歴の保存に失敗:', e); }
+    try {
+      messageJournal = mergeMessages(messageJournal, roomState.messages).slice(-JOURNAL_LIMIT);
+      localStorage.setItem(storageKey(), JSON.stringify(messageJournal));
+    } catch (e) { console.warn('履歴の保存に失敗:', e); }
   }
 
   function isValidMessage(data) {
@@ -356,14 +351,14 @@
   }
 
   function addMessageToState(data) {
-    if (!isValidMessage(data) || seenMessageIds.has(data.id)) return false;
-    seenMessageIds.add(data.id);
-    roomState.messages.push(data);
-    roomState.messages.sort((a, b) => a.time - b.time);
-    roomState.messages = roomState.messages.slice(-HISTORY_LIMIT);
-    seenMessageIds = new Set(roomState.messages.map(m => m.id));
+    const normalized=normalizeMessage(data);
+    if (!normalized) return false;
+    const existed=seenMessageIds.has(normalized.id);
+    messageJournal=mergeMessages(messageJournal,[normalized]).slice(-JOURNAL_LIMIT);
+    roomState.messages=messageJournal.slice(-HISTORY_LIMIT);
+    seenMessageIds=new Set(roomState.messages.map(m=>m.id));
     saveHistory();
-    return true;
+    return !existed;
   }
 
   function myUserRecord(host = false) {
@@ -502,6 +497,8 @@
     if (attempt === 0) addSystemLog('ホストへ接続しています…');
     const c = peer.connect(hostID, { reliable: true });
     hostConnection = c;
+    const linkToken=++activeHostLinkToken;
+    c.__hostLinkToken=linkToken;
     setupConn(c, true);
     const timeout = Math.min(1400 + attempt * 650, 4200);
     reconnectTimer = setTimeout(() => {
@@ -511,6 +508,7 @@
 
   function becomeHost(migrated) {
     isHost = true;
+    chatReady=true;
     setConnectionState('online', '接続済み・ホスト');
     migrationRunning = false;
     clearTimeout(migrationTimer);
@@ -520,6 +518,7 @@
     connections = [];
     Object.values(roomState.users).forEach(u => u.host = false);
     roomState.users[clientId] = myUserRecord(true);
+    hostSequence=Math.max(0,...messageJournal.map(m=>Number(m.hostSeq)||0));
     startChat(); renderHistory(); updateStatus();
     addSystemLog(migrated ? 'ホストを引き継ぎました。' : 'この端末がホストです。');
   }
@@ -537,12 +536,13 @@
     if (!c || c.__configured) return;
     c.__configured = true;
     c.on('open', () => {
+      if (isHostLink && !isHost && c !== hostConnection) { try{c.close();}catch(_){} return; }
       if (!connections.includes(c)) connections.push(c);
-      setConnectionState('online', isHost ? '接続済み・ホスト' : '接続済み');
+      setConnectionState('online', isHost ? '接続済み・ホスト' : '同期確認中');
+      chatReady=isHost;
       migrationRunning = false;
       clearTimeout(migrationTimer);
       clearInterval(recoveryWatchdog); recoveryWatchdog = null; recoveryStartedAt = 0; consecutiveRecoveryFailures = 0;
-      flushQueue();
       if (isHostLink) hostConnection = c;
       c.send({ type: 'hello', user: myUserRecord(isHost) });
       if (isHost) sendFullState(c);
@@ -550,6 +550,7 @@
     });
 
     c.on('data', data => {
+      if (isHostLink && !isHost && (c !== hostConnection || c.__hostLinkToken !== activeHostLinkToken)) return;
       if (!data || typeof data.type !== 'string') return;
       if (data.type === 'hello' && isHost && validUser(data.user)) {
         roomState.users[data.user.clientId] = {...data.user, peerId: c.peer, host: false, updatedAt: Date.now()};
@@ -558,15 +559,20 @@
       } else if (data.type === 'state' && !isHost) {
         applyState(data.state);
       } else if (data.type === 'chat' && isValidMessage(data)) {
+        if (isHost && !Number.isFinite(data.hostSeq)) {
+          data.hostSeq=++hostSequence; data.receivedAt=Date.now();
+        }
         if (addMessageToState(data)) {
           const followLatest=isNearLatest();
           addLog(data.name, data.msg, data.time, data.id, false, 'delivered', followLatest);
           if(!followLatest) showUnreadInsideChat();
           handleUnread();
         }
-        try { c.send({type:'ack', id:data.id}); } catch (_) {}
-        if (isHost) broadcast(data, c.peer);
+        if(isHost){broadcast(data,c.peer);try{c.send({type:'ack',id:data.id,hostSeq:data.hostSeq});}catch(_){}}
+        else{try{c.send({type:'ack',id:data.id});}catch(_){}}
       } else if (data.type === 'ack' && typeof data.id === 'string') {
+        const waiting=pendingMessages.get(data.id);
+        if(waiting&&Number.isFinite(data.hostSeq)){waiting.data.hostSeq=data.hostSeq;waiting.data.receivedAt=Date.now();addMessageToState(waiting.data);}
         markDelivered(data.id);
       }
     });
@@ -581,9 +587,11 @@
 
   function handleConnectionClosed(c, isHostLink) {
     if (c.__closedHandled) return;
+    if (isHostLink && !isHost && (c !== hostConnection || c.__hostLinkToken !== activeHostLinkToken)) return;
     c.__closedHandled = true;
     connections = connections.filter(x => x !== c);
     if (isHostLink && !isHost) {
+      chatReady=false;
       hostConnection = null;
       beginHostMigration();
     } else if (isHost) {
@@ -669,6 +677,7 @@
   }
 
   function safelyDestroyPeer(clearElection = true) {
+    chatReady=false;
     clearTimeout(reconnectTimer);
     if (clearElection) clearTimeout(migrationTimer);
     connections.forEach(c => { try { c.close(); } catch (_) {} });
@@ -678,14 +687,15 @@
 
   function applyState(state) {
     if (!state || !Array.isArray(state.messages)) return;
-    const merged = [...roomState.messages, ...state.messages].filter(isValidMessage).sort((a,b) => a.time-b.time);
-    const unique = [], ids = new Set();
-    for (const m of merged) if (!ids.has(m.id)) { ids.add(m.id); unique.push(m); }
-    roomState.messages = unique.slice(-HISTORY_LIMIT);
-    roomState.users = state.users && typeof state.users === 'object' ? state.users : {};
-    roomState.users[clientId] = myUserRecord(false);
-    seenMessageIds = new Set(roomState.messages.map(m => m.id));
+    const pending=[...pendingMessages.values()].map(item=>item.data);
+    messageJournal=mergeMessages(messageJournal,roomState.messages,state.messages,pending).slice(-JOURNAL_LIMIT);
+    roomState.messages=messageJournal.slice(-HISTORY_LIMIT);
+    roomState.users=state.users && typeof state.users==='object' ? state.users : {};
+    roomState.users[clientId]=myUserRecord(false);
+    seenMessageIds=new Set(roomState.messages.map(m=>m.id));
+    hostSequence=Math.max(hostSequence,...messageJournal.map(m=>Number(m.hostSeq)||0));
     saveHistory(); renderHistory(); updateStatus();
+    chatReady=true; setConnectionState('online','接続済み'); flushQueue();
   }
 
   function sendFullState(target) {
@@ -698,11 +708,20 @@
 
 
   function broadcast(data, skipPeer) {
-    connections.forEach(c => { if (c.open && c.peer !== skipPeer) try { c.send(data); } catch (_) {} });
+    connections.slice().forEach(c => {
+      if (!c || !c.open || c.peer === skipPeer) return;
+      try { c.send(data); } catch (_) {}
+    });
+  }
+
+  function sendChatPacket(data) {
+    if (isHost) { broadcast(data); return true; }
+    if (!chatReady || !hostConnection || !hostConnection.open) return false;
+    try { hostConnection.send(data); return true; } catch (_) { return false; }
   }
 
   function canSendNow() {
-    return peer && peer.open && (isHost || (hostConnection && hostConnection.open));
+    return Boolean(peer && peer.open && (isHost || (chatReady && hostConnection && hostConnection.open)));
   }
 
   function send() {
@@ -710,6 +729,7 @@
     if (!text) return;
     const data = { type:'chat', id:clientId+'-'+Date.now()+'-'+Math.random().toString(36).slice(2),
       name:myName.slice(0,40), msg:text.slice(0,2000), time:Date.now() };
+    if(isHost){data.hostSeq=++hostSequence;data.receivedAt=Date.now();}
     addMessageToState(data);
     addLog('YOU', data.msg, data.time, data.id, true, canSendNow() ? 'sending' : 'queued');
     pendingMessages.set(data.id, {data, attempts:0, lastSent:0, queuedAt:Date.now()});
@@ -722,7 +742,7 @@
     const item=pendingMessages.get(id); if(!item || !canSendNow()) return;
     item.attempts++; item.lastSent=Date.now();
     persistOutbox();
-    broadcast(item.data);
+    if(!sendChatPacket(item.data)){sendQueue.push(id);updateMessageStatus(id,'接続待ち・復旧後に自動送信','pending');return;}
     updateMessageStatus(id, item.attempts > 1 ? '再送中' : '送信中', 'pending');
     if (isHost) markDelivered(id);
   }
@@ -830,9 +850,19 @@
     b.style.display='block'; b.textContent='新着 '+unreadCount+'件';
   }
   function showLatest(){ unreadCount=0; document.title='Minimal P2P Chat'; document.getElementById('unread-badge').style.display='none'; scrollToLatest(true); }
-  function clearHistory(){ if(!confirm('この部屋の端末内履歴を削除しますか？'))return; roomState.messages=[];seenMessageIds.clear();saveHistory();renderHistory();addSystemLog('端末内の履歴を削除しました。'); }
+  function clearHistory(){ if(!confirm('この部屋の端末内履歴を削除しますか？'))return; roomState.messages=[];messageJournal=[];seenMessageIds.clear();saveHistory();renderHistory();addSystemLog('端末内の履歴を削除しました。'); }
 
-  document.addEventListener('visibilitychange',()=>{pageVisible=!document.hidden;if(pageVisible)showLatest();});
+  document.addEventListener('visibilitychange',()=>{
+    pageVisible=!document.hidden;
+    if(!pageVisible){ saveHistory(); persistOutbox(); return; }
+    showLatest();
+    // タブ復帰時は表示履歴を消さず、現在の回線だけ検査する。
+    const healthy=isHost ? Boolean(peer && peer.open) : Boolean(peer && peer.open && hostConnection && hostConnection.open);
+    if(!healthy && navigator.onLine){
+      setConnectionState('connecting','タブ復帰・接続確認中');
+      if(!isHost){ safelyDestroyPeer(false); createRecoveryPeer(); startRecoveryWatchdog(); }
+    } else { flushQueue(); }
+  });
   window.addEventListener('online',()=>{
     setConnectionState('connecting','通信復旧中');
     if(!isHost){ safelyDestroyPeer(false); createRecoveryPeer(); startRecoveryWatchdog(); }
@@ -854,6 +884,40 @@
     clearTimeout(migrationTimer);
     safelyDestroyPeer();
   });
+
+// パニックキー: 右矢印キーで画面を白くし、もう一度押すと復帰
+  let panicMode = false;
+  let panicAudioStates = [];
+
+  function togglePanicMode() {
+    panicMode = !panicMode;
+    document.body.classList.toggle('panic-mode', panicMode);
+    document.getElementById('panic-screen').setAttribute('aria-hidden', String(!panicMode));
+
+    if (panicMode) {
+      panicAudioStates = [];
+      document.querySelectorAll('audio, video').forEach(media => {
+        panicAudioStates.push({ media, wasPaused: media.paused });
+        try { media.pause(); } catch (_) {}
+      });
+      document.title = 'New Tab';
+    } else {
+      panicAudioStates.forEach(item => {
+        if (!item.wasPaused) item.media.play().catch(() => {});
+      });
+      panicAudioStates = [];
+      document.title = 'Minimal P2P Chat';
+      const input = document.getElementById('msg-input');
+      if (input && document.getElementById('chat-ui').style.display !== 'none') input.focus();
+    }
+  }
+
+  window.addEventListener('keydown', event => {
+    if (event.key !== 'ArrowRight' || event.repeat || event.altKey || event.ctrlKey || event.metaKey) return;
+    event.preventDefault();
+    event.stopPropagation();
+    togglePanicMode();
+  }, true);
 </script>
 </body>
 </html>
