@@ -118,7 +118,7 @@
   #chat-ui { position: fixed; bottom: 70px; left: 30px; width: 350px; display: none; flex-direction: column; z-index: 10; pointer-events: none; }
   
   #chat-box { 
-    height: 280px; overflow-y: auto; display: flex; flex-direction: column-reverse; 
+    height: 280px; overflow-y: auto; display: flex; flex-direction: column; 
     padding: 5px; 
     mask-image: linear-gradient(to top, rgba(0,0,0,1) 0%, rgba(0,0,0,1) 60%, rgba(0,0,0,0) 100%);
     -webkit-mask-image: linear-gradient(to top, rgba(0,0,0,1) 0%, rgba(0,0,0,1) 60%, rgba(0,0,0,0) 100%);
@@ -324,6 +324,12 @@
   let unreadCount = 0;
   let retryTimer = null;
   let pageVisible = !document.hidden;
+  let migrationRound = 0;
+  let migrationTimer = null;
+  let recoveryWatchdog = null;
+  let recoveryStartedAt = 0;
+  let consecutiveRecoveryFailures = 0;
+  const MAX_PENDING_AGE = 24 * 60 * 60 * 1000;
   const clientId = sessionStorage.getItem('p2p-client-id') ||
     (crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + Math.random().toString(36).slice(2));
   sessionStorage.setItem('p2p-client-id', clientId);
@@ -364,6 +370,80 @@
     return { clientId, name: myName.slice(0, 40), score: electionScore, host, updatedAt: Date.now() };
   }
 
+  function outboxKey() { return 'practical-chat-outbox:' + roomID; }
+
+  function persistOutbox() {
+    try {
+      const rows = [...pendingMessages.values()].map(item => ({
+        data: item.data, attempts: item.attempts, lastSent: item.lastSent, queuedAt: item.queuedAt || Date.now()
+      })).filter(item => Date.now() - item.queuedAt < MAX_PENDING_AGE);
+      localStorage.setItem(outboxKey(), JSON.stringify(rows));
+    } catch (e) { console.warn('送信待ち保存失敗:', e); }
+  }
+
+  function restoreOutbox() {
+    try {
+      const rows = JSON.parse(localStorage.getItem(outboxKey()) || '[]');
+      if (!Array.isArray(rows)) return;
+      rows.forEach(item => {
+        if (!item || !isValidMessage(item.data)) return;
+        if (Date.now() - Number(item.queuedAt || 0) >= MAX_PENDING_AGE) return;
+        pendingMessages.set(item.data.id, {
+          data: item.data, attempts: Number(item.attempts || 0), lastSent: 0, queuedAt: Number(item.queuedAt || Date.now())
+        });
+        if (!seenMessageIds.has(item.data.id)) addMessageToState(item.data);
+        sendQueue.push(item.data.id);
+      });
+    } catch (e) { console.warn('送信待ち復元失敗:', e); }
+  }
+
+  function startRecoveryWatchdog() {
+    clearInterval(recoveryWatchdog);
+    recoveryStartedAt = Date.now();
+    recoveryWatchdog = setInterval(() => {
+      if (isHost || (hostConnection && hostConnection.open)) {
+        consecutiveRecoveryFailures = 0;
+        recoveryStartedAt = 0;
+        clearInterval(recoveryWatchdog);
+        recoveryWatchdog = null;
+        flushQueue();
+        return;
+      }
+      const elapsed = Date.now() - recoveryStartedAt;
+      if (elapsed > 30000) {
+        recoveryStartedAt = Date.now();
+        consecutiveRecoveryFailures++;
+        migrationRunning = false;
+        migrationRound++;
+        safelyDestroyPeer(false);
+        setConnectionState('connecting', '復旧を再試行中 ' + consecutiveRecoveryFailures);
+        if (navigator.onLine) createRecoveryPeer();
+      }
+    }, 2000);
+  }
+
+  function createRecoveryPeer() {
+    if (!navigator.onLine || isHost) return;
+    peer = new Peer();
+    bindPeerBaseEvents(peer);
+    let opened = false;
+    const openTimeout = setTimeout(() => {
+      if (!opened) { safelyDestroyPeer(false); beginHostMigration(true); }
+    }, 6000);
+    peer.on('open', () => {
+      opened = true;
+      clearTimeout(openTimeout);
+      migrationRunning = false;
+      startChat();
+      connectToHost(0);
+    });
+    peer.on('error', () => {
+      clearTimeout(openTimeout);
+      safelyDestroyPeer(false);
+      setTimeout(() => beginHostMigration(true), 800 + Math.random() * 800);
+    });
+  }
+
   function initP2P() {
     roomID = document.getElementById('room-num').value.trim();
     myName = document.getElementById('user-name').value.trim();
@@ -373,6 +453,7 @@
     hostID = 'SPACE-ROOM-' + roomID;
     roomState.messages = safeLoadHistory();
     seenMessageIds = new Set(roomState.messages.map(m => m.id));
+    restoreOutbox();
     createInitialPeer();
   }
 
@@ -395,7 +476,6 @@
     bindPeerBaseEvents(peer);
     peer.on('open', () => {
       isHost = false;
-      migrationRunning = false;
       startChat();
       renderHistory();
       connectToHost();
@@ -412,13 +492,18 @@
 
   function connectToHost(attempt = 0) {
     clearTimeout(reconnectTimer);
+    if (!recoveryWatchdog) startRecoveryWatchdog();
     if (!peer || peer.destroyed || isHost) return;
+    if (attempt >= 5) {
+      beginHostMigration(true);
+      return;
+    }
     setConnectionState('connecting', attempt ? '再接続中 ' + attempt : '接続中');
-    addSystemLog(attempt ? '新しいホストへ再接続しています…' : 'ホストへ接続しています…');
+    if (attempt === 0) addSystemLog('ホストへ接続しています…');
     const c = peer.connect(hostID, { reliable: true });
     hostConnection = c;
     setupConn(c, true);
-    const timeout = Math.min(1200 + attempt * 500, 5000);
+    const timeout = Math.min(1400 + attempt * 650, 4200);
     reconnectTimer = setTimeout(() => {
       if (!isHost && (!hostConnection || !hostConnection.open)) connectToHost(attempt + 1);
     }, timeout);
@@ -428,6 +513,9 @@
     isHost = true;
     setConnectionState('online', '接続済み・ホスト');
     migrationRunning = false;
+    clearTimeout(migrationTimer);
+    clearTimeout(reconnectTimer);
+    clearInterval(recoveryWatchdog); recoveryWatchdog = null; recoveryStartedAt = 0; consecutiveRecoveryFailures = 0;
     hostConnection = null;
     connections = [];
     Object.values(roomState.users).forEach(u => u.host = false);
@@ -451,6 +539,9 @@
     c.on('open', () => {
       if (!connections.includes(c)) connections.push(c);
       setConnectionState('online', isHost ? '接続済み・ホスト' : '接続済み');
+      migrationRunning = false;
+      clearTimeout(migrationTimer);
+      clearInterval(recoveryWatchdog); recoveryWatchdog = null; recoveryStartedAt = 0; consecutiveRecoveryFailures = 0;
       flushQueue();
       if (isHostLink) hostConnection = c;
       c.send({ type: 'hello', user: myUserRecord(isHost) });
@@ -468,7 +559,9 @@
         applyState(data.state);
       } else if (data.type === 'chat' && isValidMessage(data)) {
         if (addMessageToState(data)) {
-          addLog(data.name, data.msg, data.time, data.id, false, 'delivered');
+          const followLatest=isNearLatest();
+          addLog(data.name, data.msg, data.time, data.id, false, 'delivered', followLatest);
+          if(!followLatest) showUnreadInsideChat();
           handleUnread();
         }
         try { c.send({type:'ack', id:data.id}); } catch (_) {}
@@ -501,48 +594,83 @@
     updateStatus();
   }
 
-  function beginHostMigration() {
-    if (migrationRunning || isHost) return;
+  function beginHostMigration(force = false) {
+    if ((migrationRunning && !force) || isHost) return;
     migrationRunning = true;
-    setConnectionState('connecting', 'ホスト交代中');
-    addSystemLog('ホストが退出しました。新しいホストを選出します…');
+    if (!recoveryWatchdog) startRecoveryWatchdog();
+    migrationRound++;
+    const thisRound = migrationRound;
+    clearTimeout(reconnectTimer);
+    clearTimeout(migrationTimer);
+    setConnectionState('connecting', 'ホスト再選出中');
+    addSystemLog(force ? 'ホストに接続できないため再選出します…' : 'ホストが退出しました。再選出します…');
+
     const candidates = Object.values(roomState.users)
-      .filter(u => validUser(u) && !u.host)
-      .sort((a, b) => b.score - a.score || a.clientId.localeCompare(b.clientId));
+      .filter(u => validUser(u) && !u.host);
     if (!candidates.some(u => u.clientId === clientId)) candidates.push(myUserRecord(false));
     candidates.sort((a, b) => b.score - a.score || a.clientId.localeCompare(b.clientId));
-    const winner = candidates[0];
-    if (winner && winner.clientId === clientId) claimHostId(0);
-    else {
-      const delay = 1300 + Math.floor(electionScore * 700);
-      reconnectTimer = setTimeout(() => {
-        safelyDestroyPeer();
-        createClientPeer();
-      }, delay);
-    }
+    const rank = Math.max(0, candidates.findIndex(u => u.clientId === clientId));
+
+    // すべての参加者が順位順にホスト取得へ挑戦する。
+    // 上位端末がスリープ・切断中でも次順位が引き継げる。
+    const delay = 650 + rank * 1250 + Math.floor(Math.random() * 220);
+    setConnectionState('connecting', 'ホスト候補 ' + (rank + 1) + '位・待機中');
+    migrationTimer = setTimeout(() => {
+      if (isHost || thisRound !== migrationRound) return;
+      claimHostId(thisRound);
+    }, delay);
   }
 
-  function claimHostId(attempt) {
-    safelyDestroyPeer();
+  function claimHostId(round) {
+    if (isHost || round !== migrationRound) return;
+    setConnectionState('connecting', 'ホスト引き継ぎ試行中');
+    safelyDestroyPeer(false);
     peer = new Peer(hostID);
     bindPeerBaseEvents(peer);
-    let settled = false;
-    peer.on('open', () => { settled = true; becomeHost(true); });
+    let finished = false;
+    const fallbackTimer = setTimeout(() => {
+      if (finished || isHost || round !== migrationRound) return;
+      finished = true;
+      becomeClientAfterElection(round);
+    }, 3500);
+
+    peer.on('open', () => {
+      if (finished || round !== migrationRound) return;
+      finished = true;
+      clearTimeout(fallbackTimer);
+      becomeHost(true);
+      flushQueue();
+    });
     peer.on('error', err => {
-      if (settled) return;
-      if (err.type === 'unavailable-id' && attempt < 8) {
-        safelyDestroyPeer();
-        setTimeout(() => claimHostId(attempt + 1), 500 + attempt * 350);
-      } else {
-        migrationRunning = false;
-        safelyDestroyPeer();
-        createClientPeer();
-      }
+      if (finished || round !== migrationRound) return;
+      finished = true;
+      clearTimeout(fallbackTimer);
+      // unavailable-id は別端末が取得済み、その他も一度クライアントとして探索する。
+      becomeClientAfterElection(round);
     });
   }
 
-  function safelyDestroyPeer() {
+  function becomeClientAfterElection(round) {
+    if (isHost || round !== migrationRound) return;
+    safelyDestroyPeer(false);
+    peer = new Peer();
+    bindPeerBaseEvents(peer);
+    peer.on('open', () => {
+      if (round !== migrationRound || isHost) return;
+      migrationRunning = false;
+      startChat();
+      connectToHost(0);
+    });
+    peer.on('error', () => {
+      if (round !== migrationRound || isHost) return;
+      migrationRunning = false;
+      migrationTimer = setTimeout(() => beginHostMigration(true), 1200 + Math.random() * 600);
+    });
+  }
+
+  function safelyDestroyPeer(clearElection = true) {
     clearTimeout(reconnectTimer);
+    if (clearElection) clearTimeout(migrationTimer);
     connections.forEach(c => { try { c.close(); } catch (_) {} });
     connections = [];
     try { if (peer && !peer.destroyed) peer.destroy(); } catch (_) {}
@@ -584,7 +712,8 @@
       name:myName.slice(0,40), msg:text.slice(0,2000), time:Date.now() };
     addMessageToState(data);
     addLog('YOU', data.msg, data.time, data.id, true, canSendNow() ? 'sending' : 'queued');
-    pendingMessages.set(data.id, {data, attempts:0, lastSent:0});
+    pendingMessages.set(data.id, {data, attempts:0, lastSent:0, queuedAt:Date.now()});
+    persistOutbox();
     if (canSendNow()) transmitPending(data.id); else sendQueue.push(data.id);
     input.value = '';
   }
@@ -592,6 +721,7 @@
   function transmitPending(id) {
     const item=pendingMessages.get(id); if(!item || !canSendNow()) return;
     item.attempts++; item.lastSent=Date.now();
+    persistOutbox();
     broadcast(item.data);
     updateMessageStatus(id, item.attempts > 1 ? '再送中' : '送信中', 'pending');
     if (isHost) markDelivered(id);
@@ -605,6 +735,7 @@
   function markDelivered(id) {
     if (!pendingMessages.has(id)) return;
     pendingMessages.delete(id);
+    persistOutbox();
     updateMessageStatus(id, '配信済み', '');
   }
 
@@ -612,8 +743,13 @@
     const now=Date.now();
     pendingMessages.forEach((item,id) => {
       if (now-item.lastSent < 4000) return;
-      if (item.attempts >= 4) updateMessageStatus(id, '送信失敗・タップで再送', 'failed');
-      else if (canSendNow()) transmitPending(id);
+      if (item.attempts >= 4 && !canSendNow()) {
+        updateMessageStatus(id, '接続待ち・復旧後に自動送信', 'pending');
+      } else if (item.attempts >= 8) {
+        updateMessageStatus(id, '自動再送待ち・タップでも再送可', 'failed');
+        item.attempts = 0; item.lastSent = now;
+        persistOutbox();
+      } else if (canSendNow()) transmitPending(id);
     });
   }
 
@@ -624,10 +760,11 @@
 
   function renderHistory() {
     const box=document.getElementById('chat-box'); box.textContent='';
-    roomState.messages.slice().reverse().forEach(m => addLog(m.name,m.msg,m.time,m.id,m.name===myName,'delivered'));
+    roomState.messages.forEach(m => addLog(m.name,m.msg,m.time,m.id,m.name===myName,'delivered',false));
+    scrollToLatest(false);
   }
 
-  function addLog(name,text,time,id='',own=false,status='') {
+  function addLog(name,text,time,id='',own=false,status='',autoScroll=true) {
     const box=document.getElementById('chat-box'), div=document.createElement('div');
     div.className='msg'+(own?' own':'')+(status==='queued'||status==='sending'?' pending':'');
     if(id) { div.dataset.messageId=id; div.onclick=()=>div.classList.contains('failed')&&retryMessage(id); }
@@ -635,7 +772,8 @@
     const t=document.createElement('span'); t.className='msg-text'; t.textContent=text;
     const meta=document.createElement('span'); meta.className='msg-meta';
     meta.textContent=(time?new Date(time).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}):'')+(own&&status?' · '+statusLabel(status):'');
-    div.append(n,t,meta); box.insertBefore(div,box.firstChild);
+    div.append(n,t,meta); box.appendChild(div);
+    if(autoScroll) scrollToLatest(true);
   }
 
   function statusLabel(s) { return ({queued:'送信待ち',sending:'送信中',delivered:'配信済み'}[s]||s); }
@@ -647,14 +785,16 @@
 
   function addSystemLog(text) {
     const box=document.getElementById('chat-box'), div=document.createElement('div');
-    div.className='sys-msg'; div.textContent=text; box.insertBefore(div,box.firstChild);
+    div.className='sys-msg'; div.textContent=text; box.appendChild(div); scrollToLatest(true);
   }
 
   function setConnectionState(state,label) {
     connectionState=state; const badge=document.getElementById('connection-badge'); if(!badge)return;
     badge.className=state; badge.textContent=label;
-    const disabled=state==='offline'; document.getElementById('msg-input').disabled=disabled;
-    document.getElementById('send-btn').disabled=disabled;
+    const input=document.getElementById('msg-input');
+    const button=document.getElementById('send-btn');
+    input.disabled=false; button.disabled=false;
+    input.placeholder=state==='online' ? 'Message' : '再接続中でも送信できます';
   }
 
   function updateStatus() {
@@ -667,16 +807,40 @@
     const status=document.getElementById('room-status'); status.title=isHost?'この端末がホストです':'参加者';
   }
 
+  function isNearLatest() {
+    const box=document.getElementById('chat-box');
+    return box.scrollHeight - box.scrollTop - box.clientHeight < 70;
+  }
+
+  function scrollToLatest(smooth=true) {
+    const box=document.getElementById('chat-box');
+    if(!box) return;
+    requestAnimationFrame(() => box.scrollTo({top:box.scrollHeight, behavior:smooth?'smooth':'auto'}));
+  }
+
   function handleUnread() {
-    if(pageVisible) return; unreadCount++; document.title='('+unreadCount+') 新着メッセージ';
+    if(pageVisible) return;
+    if(unreadCount===0) unreadCount=1;
+    document.title='('+unreadCount+') 新着メッセージ';
     const b=document.getElementById('unread-badge'); b.style.display='block'; b.textContent='新着 '+unreadCount+'件';
   }
-  function showLatest(){ unreadCount=0; document.title='Minimal P2P Chat'; document.getElementById('unread-badge').style.display='none'; document.getElementById('chat-box').scrollTop=0; }
+  function showUnreadInsideChat() {
+    unreadCount++;
+    const b=document.getElementById('unread-badge');
+    b.style.display='block'; b.textContent='新着 '+unreadCount+'件';
+  }
+  function showLatest(){ unreadCount=0; document.title='Minimal P2P Chat'; document.getElementById('unread-badge').style.display='none'; scrollToLatest(true); }
   function clearHistory(){ if(!confirm('この部屋の端末内履歴を削除しますか？'))return; roomState.messages=[];seenMessageIds.clear();saveHistory();renderHistory();addSystemLog('端末内の履歴を削除しました。'); }
 
   document.addEventListener('visibilitychange',()=>{pageVisible=!document.hidden;if(pageVisible)showLatest();});
-  window.addEventListener('online',()=>{setConnectionState('connecting','再接続中');if(!isHost)connectToHost();});
-  window.addEventListener('offline',()=>setConnectionState('offline','オフライン'));
+  window.addEventListener('online',()=>{
+    setConnectionState('connecting','通信復旧中');
+    if(!isHost){ safelyDestroyPeer(false); createRecoveryPeer(); startRecoveryWatchdog(); }
+  });
+  window.addEventListener('offline',()=>{
+    setConnectionState('offline','オフライン・送信は保留されます');
+    persistOutbox();
+  });
   retryTimer=setInterval(retryPending,1000);
   window.addEventListener('DOMContentLoaded',()=>{
     document.getElementById('room-num').value=localStorage.getItem('practical-chat-room')||'';
@@ -684,7 +848,10 @@
   });
 
   window.addEventListener('beforeunload', () => {
+    persistOutbox();
     clearInterval(retryTimer);
+    clearInterval(recoveryWatchdog);
+    clearTimeout(migrationTimer);
     safelyDestroyPeer();
   });
 </script>
