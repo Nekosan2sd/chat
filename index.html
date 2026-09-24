@@ -290,6 +290,8 @@
   let hostSequence = 0;
   let activeHostLinkToken = 0;
   let chatReady = false;
+  const deliveryTrackers = new Map();
+  const DELIVERY_TIMEOUT = 8000;
   let scrollFrame = 0;
   let lastRenderedSignature = '';
   let seenMessageIds = new Set();
@@ -413,7 +415,7 @@
         return;
       }
       const elapsed = Date.now() - recoveryStartedAt;
-      if (elapsed > 30000) {
+      if (elapsed > 8000) {
         recoveryStartedAt = Date.now();
         consecutiveRecoveryFailures++;
         migrationRunning = false;
@@ -422,7 +424,7 @@
         setConnectionState('connecting', '復旧を再試行中 ' + consecutiveRecoveryFailures);
         if (navigator.onLine) createRecoveryPeer();
       }
-    }, 2000);
+    }, 750);
   }
 
   function createRecoveryPeer() {
@@ -432,7 +434,7 @@
     let opened = false;
     const openTimeout = setTimeout(() => {
       if (!opened) { safelyDestroyPeer(false); beginHostMigration(true); }
-    }, 6000);
+    }, 2200);
     peer.on('open', () => {
       opened = true;
       clearTimeout(openTimeout);
@@ -443,7 +445,7 @@
     peer.on('error', () => {
       clearTimeout(openTimeout);
       safelyDestroyPeer(false);
-      setTimeout(() => beginHostMigration(true), 800 + Math.random() * 800);
+      setTimeout(() => beginHostMigration(true), 250 + Math.random() * 250);
     });
   }
 
@@ -497,18 +499,18 @@
     clearTimeout(reconnectTimer);
     if (!recoveryWatchdog) startRecoveryWatchdog();
     if (!peer || peer.destroyed || isHost) return;
-    if (attempt >= 5) {
+    if (attempt >= 2) {
       beginHostMigration(true);
       return;
     }
-    setConnectionState('connecting', attempt ? '再接続中 ' + attempt : '接続中');
+    setConnectionState('connecting', attempt ? '高速再接続中 ' + attempt : '接続確認中');
     if (attempt === 0) addSystemLog('ホストへ接続しています…');
     const c = peer.connect(hostID, { reliable: true });
     hostConnection = c;
     const linkToken=++activeHostLinkToken;
     c.__hostLinkToken=linkToken;
     setupConn(c, true);
-    const timeout = Math.min(1400 + attempt * 650, 4200);
+    const timeout = attempt === 0 ? 550 : 900;
     reconnectTimer = setTimeout(() => {
       if (!isHost && (!hostConnection || !hostConnection.open)) connectToHost(attempt + 1);
     }, timeout);
@@ -555,7 +557,6 @@
       }
       if (isHostLink) hostConnection = c;
       c.send({ type: 'hello', user: myUserRecord(isHost) });
-      if (isHost) sendFullState(c);
       updateStatus();
     });
 
@@ -563,8 +564,9 @@
       if (isHostLink && !isHost && (c !== hostConnection || c.__hostLinkToken !== activeHostLinkToken)) return;
       if (!data || typeof data.type !== 'string') return;
       if (data.type === 'hello' && isHost && validUser(data.user)) {
+        const wasKnown=Boolean(roomState.users[data.user.clientId]);
         roomState.users[data.user.clientId] = {...data.user, peerId: c.peer, host: false, updatedAt: Date.now()};
-        addSystemLog(data.user.name + ' が入室しました。');
+        if(!wasKnown) addSystemLog(data.user.name + ' が入室しました。');
         // 履歴を含む完全状態は、新しく入った端末だけへ送る。
         sendFullState(c);
         // 既存参加者へは軽量な在室一覧だけを送る。再描画・再同期はさせない。
@@ -585,17 +587,26 @@
           if(!followLatest) showUnreadInsideChat();
           handleUnread();
         }
-        if(isHost){broadcast(data,c.peer);try{c.send({type:'ack',id:data.id,hostSeq:data.hostSeq});}catch(_){}}
-        else{try{c.send({type:'ack',id:data.id});}catch(_){}}
-      } else if (data.type === 'ack' && typeof data.id === 'string') {
+        if(isHost){
+          // 先にホスト受信を通知し、その後に各受信端末の確認を集計する。
+          // 受信者0人の場合も最終通知が後から届く順序に固定する。
+          try{c.send({type:'hostAccepted',id:data.id,hostSeq:data.hostSeq});}catch(_){}
+          broadcast(data,c.peer);
+          beginDeliveryTracking(data,c);
+        } else {
+          try{c.send({type:'recipientAck',id:data.id});}catch(_){}
+        }
+      } else if (data.type === 'hostAccepted' && typeof data.id === 'string') {
         const waiting=pendingMessages.get(data.id);
         if(waiting&&Number.isFinite(data.hostSeq)){
-          waiting.data.hostSeq=data.hostSeq;
-          waiting.data.receivedAt=Date.now();
-          messageJournal=mergeMessages(messageJournal,[waiting.data]).slice(-JOURNAL_LIMIT);
-          saveHistory();
+          waiting.data.hostSeq=data.hostSeq; waiting.data.receivedAt=Date.now();
+          messageJournal=mergeMessages(messageJournal,[waiting.data]).slice(-JOURNAL_LIMIT); saveHistory();
         }
-        markDelivered(data.id);
+        markHostAccepted(data.id);
+      } else if (data.type === 'recipientAck' && isHost && typeof data.id === 'string') {
+        recordRecipientAck(data.id,c.peer);
+      } else if (data.type === 'deliveryReceipt' && typeof data.id === 'string') {
+        updateDeliveryReceipt(data);
       }
     });
 
@@ -612,13 +623,22 @@
     if (isHostLink && !isHost && (c !== hostConnection || c.__hostLinkToken !== activeHostLinkToken)) return;
     c.__closedHandled = true;
     connections = connections.filter(x => x !== c);
+    if(isHost){
+      deliveryTrackers.forEach((tracker,id)=>{
+        tracker.expected.delete(c.peer);
+        if(tracker.acked.size>=tracker.expected.size) finishDeliveryTracking(id,false);
+      });
+    }
     if (isHostLink && !isHost) {
       chatReady=false;
       hostConnection = null;
       beginHostMigration();
     } else if (isHost) {
       const entry = Object.values(roomState.users).find(u => u.peerId === c.peer);
-      if (entry) { delete roomState.users[entry.clientId]; addSystemLog(entry.name + ' が退出しました。'); }
+      if (entry && entry.peerId===c.peer) {
+        delete roomState.users[entry.clientId];
+        addSystemLog(entry.name + ' が退出しました。');
+      }
       broadcastPresence();
     }
     updateStatus();
@@ -643,7 +663,7 @@
 
     // すべての参加者が順位順にホスト取得へ挑戦する。
     // 上位端末がスリープ・切断中でも次順位が引き継げる。
-    const delay = 650 + rank * 1250 + Math.floor(Math.random() * 220);
+    const delay = 180 + rank * 320 + Math.floor(Math.random() * 70);
     setConnectionState('connecting', 'ホスト候補 ' + (rank + 1) + '位・待機中');
     migrationTimer = setTimeout(() => {
       if (isHost || thisRound !== migrationRound) return;
@@ -662,7 +682,7 @@
       if (finished || isHost || round !== migrationRound) return;
       finished = true;
       becomeClientAfterElection(round);
-    }, 3500);
+    }, 1400);
 
     peer.on('open', () => {
       if (finished || round !== migrationRound) return;
@@ -694,11 +714,12 @@
     peer.on('error', () => {
       if (round !== migrationRound || isHost) return;
       migrationRunning = false;
-      migrationTimer = setTimeout(() => beginHostMigration(true), 1200 + Math.random() * 600);
+      migrationTimer = setTimeout(() => beginHostMigration(true), 350 + Math.random() * 250);
     });
   }
 
   function safelyDestroyPeer(clearElection = true) {
+    deliveryTrackers.forEach(t=>clearTimeout(t.timer)); deliveryTrackers.clear();
     chatReady=false;
     clearTimeout(reconnectTimer);
     if (clearElection) clearTimeout(migrationTimer);
@@ -746,8 +767,44 @@
     });
   }
 
+  function connectedRecipientPeers(exceptPeer='') {
+    return connections.filter(c=>c && c.open && c.peer!==exceptPeer).map(c=>c.peer);
+  }
+
+  function beginDeliveryTracking(message, senderConn=null) {
+    if(!isHost || !message || !message.id) return;
+    const senderPeer=senderConn ? senderConn.peer : null;
+    const expected=new Set(connectedRecipientPeers(senderPeer));
+    const tracker={messageId:message.id, senderConn, expected, acked:new Set(), timer:null};
+    deliveryTrackers.set(message.id,tracker);
+    if(expected.size===0){ finishDeliveryTracking(message.id,false); return; }
+    tracker.timer=setTimeout(()=>finishDeliveryTracking(message.id,true),DELIVERY_TIMEOUT);
+  }
+
+  function recordRecipientAck(messageId,peerId) {
+    const tracker=deliveryTrackers.get(messageId);
+    if(!tracker || !tracker.expected.has(peerId)) return;
+    tracker.acked.add(peerId);
+    if(tracker.acked.size>=tracker.expected.size) finishDeliveryTracking(messageId,false);
+  }
+
+  function finishDeliveryTracking(messageId,timedOut) {
+    const tracker=deliveryTrackers.get(messageId); if(!tracker)return;
+    clearTimeout(tracker.timer); deliveryTrackers.delete(messageId);
+    const receipt={type:'deliveryReceipt',id:messageId,delivered:tracker.acked.size,total:tracker.expected.size,timedOut};
+    if(tracker.senderConn && tracker.senderConn.open){ try{tracker.senderConn.send(receipt);}catch(_){} }
+    else updateDeliveryReceipt(receipt);
+  }
+
+  function updateDeliveryReceipt(receipt) {
+    const total=Number(receipt.total||0), delivered=Number(receipt.delivered||0);
+    if(receipt.timedOut && delivered<total) updateMessageStatus(receipt.id,'一部未確認 '+delivered+'/'+total,'failed');
+    else if(total===0) updateMessageStatus(receipt.id,'ホスト受信済み','');
+    else updateMessageStatus(receipt.id,'全員に配信済み '+delivered+'/'+total,'');
+  }
+
   function sendChatPacket(data) {
-    if (isHost) { broadcast(data); return true; }
+    if (isHost) { broadcast(data); beginDeliveryTracking(data,null); return true; }
     if (!chatReady || !hostConnection || !hostConnection.open) return false;
     try { hostConnection.send(data); return true; } catch (_) { return false; }
   }
@@ -760,7 +817,7 @@
     const input = document.getElementById('msg-input'), text = input.value.trim();
     if (!text) return;
     const data = { type:'chat', id:clientId+'-'+Date.now()+'-'+Math.random().toString(36).slice(2),
-      name:myName.slice(0,40), msg:text.slice(0,2000), time:Date.now() };
+      name:myName.slice(0,40), senderId:clientId, msg:text.slice(0,2000), time:Date.now() };
     if(isHost){data.hostSeq=++hostSequence;data.receivedAt=Date.now();}
     addMessageToState(data);
     addLog('YOU', data.msg, data.time, data.id, true, canSendNow() ? 'sending' : 'queued');
@@ -776,7 +833,7 @@
     persistOutbox();
     if(!sendChatPacket(item.data)){sendQueue.push(id);updateMessageStatus(id,'接続待ち・復旧後に自動送信','pending');return;}
     updateMessageStatus(id, item.attempts > 1 ? '再送中' : '送信中', 'pending');
-    if (isHost) markDelivered(id);
+    if (isHost) { pendingMessages.delete(id); persistOutbox(); updateMessageStatus(id,'配信確認中','pending'); }
   }
 
   function flushQueue() {
@@ -784,11 +841,11 @@
     ids.forEach(transmitPending);
   }
 
-  function markDelivered(id) {
+  function markHostAccepted(id) {
     if (!pendingMessages.has(id)) return;
     pendingMessages.delete(id);
     persistOutbox();
-    updateMessageStatus(id, '配信済み', '');
+    updateMessageStatus(id, 'ホスト受信済み・配信確認中', 'pending');
   }
 
   function retryPending() {
@@ -812,11 +869,12 @@
 
   function renderHistory() {
     const box=document.getElementById('chat-box');
+    cancelAnimationFrame(scrollFrame);
     const wasNearLatest=isNearLatest();
     box.textContent='';
-    roomState.messages.forEach(m => addLog(m.name,m.msg,m.time,m.id,m.name===myName,'delivered',false));
+    roomState.messages.forEach(m => addLog(m.name,m.msg,m.time,m.id,(m.senderId ? m.senderId===clientId : m.name===myName),'delivered',false));
     lastRenderedSignature=roomState.messages.map(m=>m.id).join('|');
-    if(wasNearLatest || box.childElementCount<=HISTORY_LIMIT) scrollToLatest(false);
+    if(wasNearLatest) scrollToLatest(false);
   }
 
   function addLog(name,text,time,id='',own=false,status='',autoScroll=true) {
@@ -894,8 +952,8 @@
   document.addEventListener('visibilitychange',()=>{
     pageVisible=!document.hidden;
     if(!pageVisible){ saveHistory(); persistOutbox(); return; }
-    showLatest();
-    // タブ復帰時は表示履歴を消さず、現在の回線だけ検査する。
+    // タブ復帰時は表示・未読・スクロール位置を勝手に変更しない。
+    // 現在の回線だけを検査する。
     const healthy=isHost ? Boolean(peer && peer.open) : Boolean(peer && peer.open && hostConnection && hostConnection.open);
     if(!healthy && navigator.onLine){
       setConnectionState('connecting','タブ復帰・接続確認中');
@@ -910,7 +968,7 @@
     setConnectionState('offline','オフライン・送信は保留されます');
     persistOutbox();
   });
-  retryTimer=setInterval(retryPending,1000);
+  retryTimer=setInterval(retryPending,500);
   window.addEventListener('DOMContentLoaded',()=>{
     document.getElementById('room-num').value=localStorage.getItem('practical-chat-room')||'';
     document.getElementById('user-name').value=localStorage.getItem('practical-chat-name')||'';
