@@ -149,6 +149,13 @@
   #msg-input:disabled, #send-btn:disabled { opacity:.45; cursor:not-allowed; }
   #send-btn { min-width:58px; border-radius:8px; background:rgba(255,255,255,.08); }
   @media (max-width:600px) { #top-panel{left:10px;top:10px} #users-panel{display:none} #chat-box{height:48vh} input{font-size:16px} }
+
+  /* 操作安定化: iPadの入力ズームとチャットの上下振動を防止 */
+  #msg-input { font-size: 16px !important; min-width: 0; }
+  #chat-box { overflow-anchor: none; scroll-behavior: auto; overscroll-behavior: contain; }
+  .msg { flex: 0 0 auto; contain: layout style; }
+  #input-area { width: 100%; box-sizing: border-box; }
+  #send-btn { flex: 0 0 auto; }
 </style>
 </head>
 <body>
@@ -283,6 +290,8 @@
   let hostSequence = 0;
   let activeHostLinkToken = 0;
   let chatReady = false;
+  let scrollFrame = 0;
+  let lastRenderedSignature = '';
   let seenMessageIds = new Set();
   let hostID = '';
   let hostConnection = null;
@@ -309,9 +318,8 @@
   function storageKey() { return 'minimal-p2p-chat:' + roomID; }
 
   function messageOrderValue(m) {
-    if (Number.isFinite(m.hostSeq)) return m.hostSeq * 10000000000000;
-    if (Number.isFinite(m.receivedAt)) return m.receivedAt;
-    return Number(m.time || 0);
+    // 表示位置は作成時刻で固定する。ACKや再接続でhostSeqが付いても飛ばさない。
+    return Number(m.time || m.receivedAt || 0);
   }
 
   function normalizeMessage(m) {
@@ -538,11 +546,13 @@
     c.on('open', () => {
       if (isHostLink && !isHost && c !== hostConnection) { try{c.close();}catch(_){} return; }
       if (!connections.includes(c)) connections.push(c);
-      setConnectionState('online', isHost ? '接続済み・ホスト' : '同期確認中');
-      chatReady=isHost;
-      migrationRunning = false;
-      clearTimeout(migrationTimer);
-      clearInterval(recoveryWatchdog); recoveryWatchdog = null; recoveryStartedAt = 0; consecutiveRecoveryFailures = 0;
+      if (isHostLink || !isHost) {
+        setConnectionState('online', isHost ? '接続済み・ホスト' : '同期確認中');
+        chatReady=isHost;
+        migrationRunning = false;
+        clearTimeout(migrationTimer);
+        clearInterval(recoveryWatchdog); recoveryWatchdog = null; recoveryStartedAt = 0; consecutiveRecoveryFailures = 0;
+      }
       if (isHostLink) hostConnection = c;
       c.send({ type: 'hello', user: myUserRecord(isHost) });
       if (isHost) sendFullState(c);
@@ -555,9 +565,16 @@
       if (data.type === 'hello' && isHost && validUser(data.user)) {
         roomState.users[data.user.clientId] = {...data.user, peerId: c.peer, host: false, updatedAt: Date.now()};
         addSystemLog(data.user.name + ' が入室しました。');
-        sendFullState();
+        // 履歴を含む完全状態は、新しく入った端末だけへ送る。
+        sendFullState(c);
+        // 既存参加者へは軽量な在室一覧だけを送る。再描画・再同期はさせない。
+        broadcastPresence(c.peer);
       } else if (data.type === 'state' && !isHost) {
         applyState(data.state);
+      } else if (data.type === 'presence' && !isHost && data.users && typeof data.users === 'object') {
+        roomState.users = data.users;
+        roomState.users[clientId] = myUserRecord(false);
+        updateStatus();
       } else if (data.type === 'chat' && isValidMessage(data)) {
         if (isHost && !Number.isFinite(data.hostSeq)) {
           data.hostSeq=++hostSequence; data.receivedAt=Date.now();
@@ -572,7 +589,12 @@
         else{try{c.send({type:'ack',id:data.id});}catch(_){}}
       } else if (data.type === 'ack' && typeof data.id === 'string') {
         const waiting=pendingMessages.get(data.id);
-        if(waiting&&Number.isFinite(data.hostSeq)){waiting.data.hostSeq=data.hostSeq;waiting.data.receivedAt=Date.now();addMessageToState(waiting.data);}
+        if(waiting&&Number.isFinite(data.hostSeq)){
+          waiting.data.hostSeq=data.hostSeq;
+          waiting.data.receivedAt=Date.now();
+          messageJournal=mergeMessages(messageJournal,[waiting.data]).slice(-JOURNAL_LIMIT);
+          saveHistory();
+        }
         markDelivered(data.id);
       }
     });
@@ -597,7 +619,7 @@
     } else if (isHost) {
       const entry = Object.values(roomState.users).find(u => u.peerId === c.peer);
       if (entry) { delete roomState.users[entry.clientId]; addSystemLog(entry.name + ' が退出しました。'); }
-      sendFullState();
+      broadcastPresence();
     }
     updateStatus();
   }
@@ -694,7 +716,10 @@
     roomState.users[clientId]=myUserRecord(false);
     seenMessageIds=new Set(roomState.messages.map(m=>m.id));
     hostSequence=Math.max(hostSequence,...messageJournal.map(m=>Number(m.hostSeq)||0));
-    saveHistory(); renderHistory(); updateStatus();
+    saveHistory();
+    const nextSignature=roomState.messages.map(m=>m.id).join('|');
+    if(nextSignature!==lastRenderedSignature) renderHistory();
+    updateStatus();
     chatReady=true; setConnectionState('online','接続済み'); flushQueue();
   }
 
@@ -703,6 +728,13 @@
     roomState.users[clientId] = myUserRecord(true);
     const data = { type: 'state', state: { messages: roomState.messages, users: roomState.users } };
     if (target && target.open) target.send(data); else broadcast(data);
+    updateStatus();
+  }
+
+  function broadcastPresence(skipPeer) {
+    if (!isHost) return;
+    roomState.users[clientId] = myUserRecord(true);
+    broadcast({ type:'presence', users:roomState.users }, skipPeer);
     updateStatus();
   }
 
@@ -779,9 +811,12 @@
   }
 
   function renderHistory() {
-    const box=document.getElementById('chat-box'); box.textContent='';
+    const box=document.getElementById('chat-box');
+    const wasNearLatest=isNearLatest();
+    box.textContent='';
     roomState.messages.forEach(m => addLog(m.name,m.msg,m.time,m.id,m.name===myName,'delivered',false));
-    scrollToLatest(false);
+    lastRenderedSignature=roomState.messages.map(m=>m.id).join('|');
+    if(wasNearLatest || box.childElementCount<=HISTORY_LIMIT) scrollToLatest(false);
   }
 
   function addLog(name,text,time,id='',own=false,status='',autoScroll=true) {
@@ -793,7 +828,8 @@
     const meta=document.createElement('span'); meta.className='msg-meta';
     meta.textContent=(time?new Date(time).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}):'')+(own&&status?' · '+statusLabel(status):'');
     div.append(n,t,meta); box.appendChild(div);
-    if(autoScroll) scrollToLatest(true);
+    if(id && !lastRenderedSignature.split('|').includes(id)) lastRenderedSignature+=(lastRenderedSignature?'|':'')+id;
+    if(autoScroll) scrollToLatest(false);
   }
 
   function statusLabel(s) { return ({queued:'送信待ち',sending:'送信中',delivered:'配信済み'}[s]||s); }
@@ -805,7 +841,7 @@
 
   function addSystemLog(text) {
     const box=document.getElementById('chat-box'), div=document.createElement('div');
-    div.className='sys-msg'; div.textContent=text; box.appendChild(div); scrollToLatest(true);
+    const follow=isNearLatest(); div.className='sys-msg'; div.textContent=text; box.appendChild(div); if(follow) scrollToLatest(false);
   }
 
   function setConnectionState(state,label) {
@@ -832,10 +868,13 @@
     return box.scrollHeight - box.scrollTop - box.clientHeight < 70;
   }
 
-  function scrollToLatest(smooth=true) {
+  function scrollToLatest(smooth=false) {
     const box=document.getElementById('chat-box');
     if(!box) return;
-    requestAnimationFrame(() => box.scrollTo({top:box.scrollHeight, behavior:smooth?'smooth':'auto'}));
+    cancelAnimationFrame(scrollFrame);
+    scrollFrame=requestAnimationFrame(() => {
+      box.scrollTop=box.scrollHeight;
+    });
   }
 
   function handleUnread() {
@@ -849,7 +888,7 @@
     const b=document.getElementById('unread-badge');
     b.style.display='block'; b.textContent='新着 '+unreadCount+'件';
   }
-  function showLatest(){ unreadCount=0; document.title='Minimal P2P Chat'; document.getElementById('unread-badge').style.display='none'; scrollToLatest(true); }
+  function showLatest(){ unreadCount=0; document.title='Minimal P2P Chat'; document.getElementById('unread-badge').style.display='none'; scrollToLatest(false); }
   function clearHistory(){ if(!confirm('この部屋の端末内履歴を削除しますか？'))return; roomState.messages=[];messageJournal=[];seenMessageIds.clear();saveHistory();renderHistory();addSystemLog('端末内の履歴を削除しました。'); }
 
   document.addEventListener('visibilitychange',()=>{
