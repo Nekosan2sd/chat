@@ -4,7 +4,42 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Minimal P2P Chat</title>
-<script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+<script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js">
+  // パニックキー: 右矢印キーで画面を白くし、もう一度押すと復帰
+  let panicMode = false;
+  let panicAudioStates = [];
+
+  function togglePanicMode() {
+    panicMode = !panicMode;
+    document.body.classList.toggle('panic-mode', panicMode);
+    document.getElementById('panic-screen').setAttribute('aria-hidden', String(!panicMode));
+
+    if (panicMode) {
+      panicAudioStates = [];
+      document.querySelectorAll('audio, video').forEach(media => {
+        panicAudioStates.push({ media, wasPaused: media.paused });
+        try { media.pause(); } catch (_) {}
+      });
+      document.title = 'New Tab';
+    } else {
+      panicAudioStates.forEach(item => {
+        if (!item.wasPaused) item.media.play().catch(() => {});
+      });
+      panicAudioStates = [];
+      document.title = 'Minimal P2P Chat';
+      const input = document.getElementById('msg-input');
+      if (input && document.getElementById('chat-ui').style.display !== 'none') input.focus();
+    }
+  }
+
+  window.addEventListener('keydown', event => {
+    if (event.key !== 'ArrowRight' || event.repeat || event.altKey || event.ctrlKey || event.metaKey) return;
+    event.preventDefault();
+    event.stopPropagation();
+    togglePanicMode();
+  }, true);
+
+</script>
 <style>
   body { margin: 0; height: 100vh; overflow: hidden; color: white; font-family: sans-serif; transition: background 0.5s; background: #000; }
   
@@ -100,11 +135,10 @@
   #input-area { display: flex; gap: 8px; margin-top: 5px; pointer-events: auto; }
   #msg-input { flex: 1; margin: 0; width: auto; background: rgba(255,255,255,0.03); }
 
-  #send-btn, #call-btn { 
+  #send-btn { 
     padding: 0 15px; background: none; color: rgba(255,255,255,0.15); 
     border: none; cursor: pointer; font-size: 0.8rem; letter-spacing: 1px;
   }
-  #call-btn { color: #55aaff; }
 
   @keyframes slideIn { from { transform: translateX(-10px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
   
@@ -116,9 +150,44 @@
   #switch-water { background: #113355; }
   #switch-matrix { background: #003300; }
   #switch-ocean { background: #001a33; }
+
+  /* 履歴同期試験版: 追加UI */
+  #room-status { position: fixed; top: 16px; right: 18px; z-index: 30; padding: 8px 11px; border: 1px solid rgba(255,255,255,0.12); border-radius: 10px; background: rgba(0,0,0,0.25); backdrop-filter: blur(8px); color: rgba(255,255,255,0.65); font-size: 12px; pointer-events: none; }
+  #room-status strong { color: white; font-weight: 500; }
+  @media (max-width: 600px) {
+    #chat-ui { left: 14px; right: 14px; width: auto; bottom: 64px; }
+    #room-status { top: 10px; right: 10px; }
+  }
+
+  /* パニックキー: 右矢印で即時非表示 */
+  #panic-screen { position: fixed; inset: 0; z-index: 99999; display: none; background: #fff; color: #111; font-family: system-ui, sans-serif; }
+  body.panic-mode #panic-screen { display: block; }
+  body.panic-mode > :not(#panic-screen) { visibility: hidden !important; }
+
+  /* 実用化アップデート */
+  #top-panel { position:fixed; top:14px; left:18px; z-index:31; display:none; gap:8px; align-items:flex-start; }
+  #connection-badge { padding:8px 11px; border-radius:10px; background:rgba(0,0,0,.35); border:1px solid rgba(255,255,255,.12); backdrop-filter:blur(8px); font-size:12px; color:#ddd; }
+  #connection-badge::before { content:''; display:inline-block; width:7px; height:7px; margin-right:7px; border-radius:50%; background:#ffb020; box-shadow:0 0 8px currentColor; }
+  #connection-badge.online::before { background:#35dd88; } #connection-badge.offline::before { background:#ff5d6c; }
+  #users-panel { width:180px; max-height:210px; overflow:auto; padding:10px; border-radius:12px; background:rgba(0,0,0,.42); border:1px solid rgba(255,255,255,.12); backdrop-filter:blur(10px); }
+  #users-title { font-size:11px; color:rgba(255,255,255,.48); margin-bottom:7px; }
+  .user-row { display:flex; align-items:center; gap:7px; padding:5px 3px; font-size:12px; color:rgba(255,255,255,.8); }
+  .user-dot { width:7px; height:7px; border-radius:50%; background:#35dd88; flex:none; }
+  #chat-toolbar { pointer-events:auto; display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; }
+  #room-label { font-size:11px; color:rgba(255,255,255,.45); }
+  .tool-btn { border:0; border-radius:7px; padding:5px 8px; color:rgba(255,255,255,.55); background:rgba(255,255,255,.06); cursor:pointer; }
+  .msg { max-width:85%; padding:8px 10px; border-radius:12px; background:rgba(255,255,255,.07); align-self:flex-start; }
+  .msg.own { align-self:flex-end; background:rgba(59,130,246,.28); text-align:right; }
+  .msg.pending { opacity:.62; } .msg.failed { outline:1px solid #ff5d6c; cursor:pointer; }
+  .msg-meta { display:block; margin-top:3px; font-size:10px; color:rgba(255,255,255,.35); }
+  #unread-badge { display:none; position:absolute; right:5px; bottom:54px; pointer-events:auto; border:0; border-radius:20px; padding:7px 11px; color:white; background:#2563eb; cursor:pointer; box-shadow:0 4px 18px rgba(0,0,0,.3); }
+  #msg-input:disabled, #send-btn:disabled { opacity:.45; cursor:not-allowed; }
+  #send-btn { min-width:58px; border-radius:8px; background:rgba(255,255,255,.08); }
+  @media (max-width:600px) { #top-panel{left:10px;top:10px} #users-panel{display:none} #chat-box{height:48vh} input{font-size:16px} }
 </style>
 </head>
 <body>
+<div id="panic-screen" aria-hidden="true"></div>
 
 <div id="bg-space" class="bg-container active"></div>
 <div id="bg-water" class="bg-container"></div>
@@ -137,12 +206,15 @@
   </div>
 </div>
 
+<div id="top-panel"><div id="connection-badge">接続準備中</div><div id="users-panel"><div id="users-title">オンライン</div><div id="users-list"></div></div></div>
+<div id="room-status" style="display:none"><strong id="online-count">1</strong> online · 履歴20件</div>
 <div id="chat-ui">
+  <div id="chat-toolbar"><span id="room-label"></span><button class="tool-btn" onclick="clearHistory()">履歴削除</button></div>
   <div id="chat-box"></div>
+  <button id="unread-badge" onclick="showLatest()">新着 0件</button>
   <div id="input-area">
     <input type="text" id="msg-input" placeholder="Message">
     <button id="send-btn" onclick="send()">SEND</button>
-    <button id="call-btn" onclick="toggleCall()">CALL</button>
   </div>
 </div>
 
@@ -238,101 +310,383 @@
       for(let i=0; i<columns; i++) drops[i] = 1;
   });
 
-  let peer, connections = [], myName, roomID, isHost = false, localStream;
+  let peer, connections = [], myName, roomID, isHost = false;
+  let roomState = { messages: [], users: {} };
+  const HISTORY_LIMIT = 20;
+  let seenMessageIds = new Set();
+  let hostID = '';
+  let hostConnection = null;
+  let migrationRunning = false;
+  let reconnectTimer = null;
+  let connectionState = 'connecting';
+  let pendingMessages = new Map();
+  let sendQueue = [];
+  let unreadCount = 0;
+  let retryTimer = null;
+  let pageVisible = !document.hidden;
+  const clientId = sessionStorage.getItem('p2p-client-id') ||
+    (crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + Math.random().toString(36).slice(2));
+  sessionStorage.setItem('p2p-client-id', clientId);
+  const electionScore = Number(sessionStorage.getItem('p2p-election-score')) || Math.random();
+  sessionStorage.setItem('p2p-election-score', String(electionScore));
+
+  function storageKey() { return 'minimal-p2p-chat:' + roomID; }
+
+  function safeLoadHistory() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(storageKey()) || '[]');
+      return Array.isArray(saved) ? saved.filter(isValidMessage).slice(-HISTORY_LIMIT) : [];
+    } catch (e) { console.warn('履歴の読み込みに失敗:', e); return []; }
+  }
+
+  function saveHistory() {
+    try { localStorage.setItem(storageKey(), JSON.stringify(roomState.messages.slice(-HISTORY_LIMIT))); }
+    catch (e) { console.warn('履歴の保存に失敗:', e); }
+  }
+
+  function isValidMessage(data) {
+    return data && data.type === 'chat' && typeof data.id === 'string' &&
+      typeof data.name === 'string' && typeof data.msg === 'string' && Number.isFinite(data.time);
+  }
+
+  function addMessageToState(data) {
+    if (!isValidMessage(data) || seenMessageIds.has(data.id)) return false;
+    seenMessageIds.add(data.id);
+    roomState.messages.push(data);
+    roomState.messages.sort((a, b) => a.time - b.time);
+    roomState.messages = roomState.messages.slice(-HISTORY_LIMIT);
+    seenMessageIds = new Set(roomState.messages.map(m => m.id));
+    saveHistory();
+    return true;
+  }
+
+  function myUserRecord(host = false) {
+    return { clientId, name: myName.slice(0, 40), score: electionScore, host, updatedAt: Date.now() };
+  }
 
   function initP2P() {
-    roomID = document.getElementById('room-num').value;
-    myName = document.getElementById('user-name').value;
-    if(!roomID || !myName) return;
-    const hostID = "SPACE-ROOM-" + roomID;
+    roomID = document.getElementById('room-num').value.trim();
+    myName = document.getElementById('user-name').value.trim();
+    localStorage.setItem('practical-chat-room', roomID);
+    localStorage.setItem('practical-chat-name', myName);
+    if (!roomID || !myName) return;
+    hostID = 'SPACE-ROOM-' + roomID;
+    roomState.messages = safeLoadHistory();
+    seenMessageIds = new Set(roomState.messages.map(m => m.id));
+    createInitialPeer();
+  }
+
+  function createInitialPeer() {
     peer = new Peer(hostID);
+    bindPeerBaseEvents(peer);
+    peer.on('open', () => becomeHost(false));
+    peer.on('error', err => {
+      if (err.type === 'unavailable-id') {
+        safelyDestroyPeer();
+        createClientPeer();
+      } else if (!migrationRunning) {
+        addSystemLog('接続エラー: ' + (err.type || 'unknown'));
+      }
+    });
+  }
+
+  function createClientPeer() {
+    peer = new Peer();
+    bindPeerBaseEvents(peer);
     peer.on('open', () => {
-      isHost = true;
+      isHost = false;
+      migrationRunning = false;
       startChat();
+      renderHistory();
+      connectToHost();
     });
-    peer.on('error', (err) => {
-      if(err.type === 'unavailable-id') {
-        peer = new Peer();
-        peer.on('open', () => {
-          isHost = false;
-          startChat();
-          setupConn(peer.connect(hostID));
-        });
-      }
+    peer.on('error', err => {
+      if (err.type !== 'peer-unavailable' && err.type !== 'network')
+        addSystemLog('接続エラー: ' + (err.type || 'unknown'));
     });
-    peer.on('connection', setupConn);
-    
-    peer.on('call', call => {
-      if (confirm("着信があります。")) {
-        navigator.mediaDevices.getUserMedia({audio: true}).then(stream => {
-          localStream = stream;
-          call.answer(stream);
-          setupCall(call);
-        });
-      }
-    });
+  }
+
+  function bindPeerBaseEvents(targetPeer) {
+    targetPeer.on('connection', setupConn);
+  }
+
+  function connectToHost(attempt = 0) {
+    clearTimeout(reconnectTimer);
+    if (!peer || peer.destroyed || isHost) return;
+    setConnectionState('connecting', attempt ? '再接続中 ' + attempt : '接続中');
+    addSystemLog(attempt ? '新しいホストへ再接続しています…' : 'ホストへ接続しています…');
+    const c = peer.connect(hostID, { reliable: true });
+    hostConnection = c;
+    setupConn(c, true);
+    const timeout = Math.min(1200 + attempt * 500, 5000);
+    reconnectTimer = setTimeout(() => {
+      if (!isHost && (!hostConnection || !hostConnection.open)) connectToHost(attempt + 1);
+    }, timeout);
+  }
+
+  function becomeHost(migrated) {
+    isHost = true;
+    setConnectionState('online', '接続済み・ホスト');
+    migrationRunning = false;
+    hostConnection = null;
+    connections = [];
+    Object.values(roomState.users).forEach(u => u.host = false);
+    roomState.users[clientId] = myUserRecord(true);
+    startChat(); renderHistory(); updateStatus();
+    addSystemLog(migrated ? 'ホストを引き継ぎました。' : 'この端末がホストです。');
   }
 
   function startChat() {
     document.getElementById('login-screen').style.display = 'none';
     document.getElementById('chat-ui').style.display = 'flex';
-    document.getElementById('msg-input').onkeydown = (e) => { if(e.key === 'Enter') send(); };
+    document.getElementById('room-status').style.display = 'block';
+    document.getElementById('top-panel').style.display = 'flex';
+    document.getElementById('room-label').textContent = 'ROOM ' + roomID;
+    document.getElementById('msg-input').onkeydown = e => { if (e.key === 'Enter') send(); };
   }
 
-  function setupConn(c) {
+  function setupConn(c, isHostLink = false) {
+    if (!c || c.__configured) return;
+    c.__configured = true;
     c.on('open', () => {
-      if(!connections.find(x => x.peer === c.peer)) {
-          connections.push(c);
+      if (!connections.includes(c)) connections.push(c);
+      setConnectionState('online', isHost ? '接続済み・ホスト' : '接続済み');
+      flushQueue();
+      if (isHostLink) hostConnection = c;
+      c.send({ type: 'hello', user: myUserRecord(isHost) });
+      if (isHost) sendFullState(c);
+      updateStatus();
+    });
+
+    c.on('data', data => {
+      if (!data || typeof data.type !== 'string') return;
+      if (data.type === 'hello' && isHost && validUser(data.user)) {
+        roomState.users[data.user.clientId] = {...data.user, peerId: c.peer, host: false, updatedAt: Date.now()};
+        addSystemLog(data.user.name + ' が入室しました。');
+        sendFullState();
+      } else if (data.type === 'state' && !isHost) {
+        applyState(data.state);
+      } else if (data.type === 'chat' && isValidMessage(data)) {
+        if (addMessageToState(data)) {
+          addLog(data.name, data.msg, data.time, data.id, false, 'delivered');
+          handleUnread();
+        }
+        try { c.send({type:'ack', id:data.id}); } catch (_) {}
+        if (isHost) broadcast(data, c.peer);
+      } else if (data.type === 'ack' && typeof data.id === 'string') {
+        markDelivered(data.id);
       }
     });
-    c.on('data', data => {
-      if(data.type === 'chat') addLog(data.name, data.msg);
-      if(isHost) broadcast(data, c.peer);
-    });
-    c.on('close', () => { connections = connections.filter(x => x.peer !== c.peer); });
+
+    c.on('close', () => handleConnectionClosed(c, isHostLink));
+    c.on('error', () => handleConnectionClosed(c, isHostLink));
   }
 
-  async function toggleCall() {
-    if(localStream) {
-        localStream.getTracks().forEach(track => track.stop());
-        localStream = null;
-        return;
+  function validUser(u) {
+    return u && typeof u.clientId === 'string' && typeof u.name === 'string' && Number.isFinite(u.score);
+  }
+
+  function handleConnectionClosed(c, isHostLink) {
+    if (c.__closedHandled) return;
+    c.__closedHandled = true;
+    connections = connections.filter(x => x !== c);
+    if (isHostLink && !isHost) {
+      hostConnection = null;
+      beginHostMigration();
+    } else if (isHost) {
+      const entry = Object.values(roomState.users).find(u => u.peerId === c.peer);
+      if (entry) { delete roomState.users[entry.clientId]; addSystemLog(entry.name + ' が退出しました。'); }
+      sendFullState();
     }
-    localStream = await navigator.mediaDevices.getUserMedia({audio: true});
-    connections.forEach(conn => {
-        const call = peer.call(conn.peer, localStream);
-        setupCall(call);
+    updateStatus();
+  }
+
+  function beginHostMigration() {
+    if (migrationRunning || isHost) return;
+    migrationRunning = true;
+    setConnectionState('connecting', 'ホスト交代中');
+    addSystemLog('ホストが退出しました。新しいホストを選出します…');
+    const candidates = Object.values(roomState.users)
+      .filter(u => validUser(u) && !u.host)
+      .sort((a, b) => b.score - a.score || a.clientId.localeCompare(b.clientId));
+    if (!candidates.some(u => u.clientId === clientId)) candidates.push(myUserRecord(false));
+    candidates.sort((a, b) => b.score - a.score || a.clientId.localeCompare(b.clientId));
+    const winner = candidates[0];
+    if (winner && winner.clientId === clientId) claimHostId(0);
+    else {
+      const delay = 1300 + Math.floor(electionScore * 700);
+      reconnectTimer = setTimeout(() => {
+        safelyDestroyPeer();
+        createClientPeer();
+      }, delay);
+    }
+  }
+
+  function claimHostId(attempt) {
+    safelyDestroyPeer();
+    peer = new Peer(hostID);
+    bindPeerBaseEvents(peer);
+    let settled = false;
+    peer.on('open', () => { settled = true; becomeHost(true); });
+    peer.on('error', err => {
+      if (settled) return;
+      if (err.type === 'unavailable-id' && attempt < 8) {
+        safelyDestroyPeer();
+        setTimeout(() => claimHostId(attempt + 1), 500 + attempt * 350);
+      } else {
+        migrationRunning = false;
+        safelyDestroyPeer();
+        createClientPeer();
+      }
     });
   }
 
-  function setupCall(call) {
-    call.on('stream', remoteStream => {
-      const audio = new Audio();
-      audio.srcObject = remoteStream;
-      audio.play();
-    });
+  function safelyDestroyPeer() {
+    clearTimeout(reconnectTimer);
+    connections.forEach(c => { try { c.close(); } catch (_) {} });
+    connections = [];
+    try { if (peer && !peer.destroyed) peer.destroy(); } catch (_) {}
   }
+
+  function applyState(state) {
+    if (!state || !Array.isArray(state.messages)) return;
+    const merged = [...roomState.messages, ...state.messages].filter(isValidMessage).sort((a,b) => a.time-b.time);
+    const unique = [], ids = new Set();
+    for (const m of merged) if (!ids.has(m.id)) { ids.add(m.id); unique.push(m); }
+    roomState.messages = unique.slice(-HISTORY_LIMIT);
+    roomState.users = state.users && typeof state.users === 'object' ? state.users : {};
+    roomState.users[clientId] = myUserRecord(false);
+    seenMessageIds = new Set(roomState.messages.map(m => m.id));
+    saveHistory(); renderHistory(); updateStatus();
+  }
+
+  function sendFullState(target) {
+    if (!isHost) return;
+    roomState.users[clientId] = myUserRecord(true);
+    const data = { type: 'state', state: { messages: roomState.messages, users: roomState.users } };
+    if (target && target.open) target.send(data); else broadcast(data);
+    updateStatus();
+  }
+
 
   function broadcast(data, skipPeer) {
-    connections.forEach(conn => { if(conn.open && conn.peer !== skipPeer) conn.send(data); });
+    connections.forEach(c => { if (c.open && c.peer !== skipPeer) try { c.send(data); } catch (_) {} });
+  }
+
+  function canSendNow() {
+    return peer && peer.open && (isHost || (hostConnection && hostConnection.open));
   }
 
   function send() {
-    const input = document.getElementById('msg-input');
-    if(!input.value) return;
-    const data = { type: 'chat', name: myName, msg: input.value };
-    broadcast(data);
-    addLog("YOU", input.value);
+    const input = document.getElementById('msg-input'), text = input.value.trim();
+    if (!text) return;
+    const data = { type:'chat', id:clientId+'-'+Date.now()+'-'+Math.random().toString(36).slice(2),
+      name:myName.slice(0,40), msg:text.slice(0,2000), time:Date.now() };
+    addMessageToState(data);
+    addLog('YOU', data.msg, data.time, data.id, true, canSendNow() ? 'sending' : 'queued');
+    pendingMessages.set(data.id, {data, attempts:0, lastSent:0});
+    if (canSendNow()) transmitPending(data.id); else sendQueue.push(data.id);
     input.value = '';
   }
 
-  function addLog(name, text) {
-    const box = document.getElementById('chat-box');
-    const div = document.createElement('div');
-    div.className = 'msg';
-    div.innerHTML = `<span class="msg-name">${name}</span><span class="msg-text">${text}</span>`;
-    box.insertBefore(div, box.firstChild);
+  function transmitPending(id) {
+    const item=pendingMessages.get(id); if(!item || !canSendNow()) return;
+    item.attempts++; item.lastSent=Date.now();
+    broadcast(item.data);
+    updateMessageStatus(id, item.attempts > 1 ? '再送中' : '送信中', 'pending');
+    if (isHost) markDelivered(id);
   }
+
+  function flushQueue() {
+    const ids=[...new Set([...sendQueue, ...pendingMessages.keys()])]; sendQueue=[];
+    ids.forEach(transmitPending);
+  }
+
+  function markDelivered(id) {
+    if (!pendingMessages.has(id)) return;
+    pendingMessages.delete(id);
+    updateMessageStatus(id, '配信済み', '');
+  }
+
+  function retryPending() {
+    const now=Date.now();
+    pendingMessages.forEach((item,id) => {
+      if (now-item.lastSent < 4000) return;
+      if (item.attempts >= 4) updateMessageStatus(id, '送信失敗・タップで再送', 'failed');
+      else if (canSendNow()) transmitPending(id);
+    });
+  }
+
+  function retryMessage(id) {
+    const item=pendingMessages.get(id); if(!item) return;
+    item.attempts=0; item.lastSent=0; transmitPending(id);
+  }
+
+  function renderHistory() {
+    const box=document.getElementById('chat-box'); box.textContent='';
+    roomState.messages.slice().reverse().forEach(m => addLog(m.name,m.msg,m.time,m.id,m.name===myName,'delivered'));
+  }
+
+  function addLog(name,text,time,id='',own=false,status='') {
+    const box=document.getElementById('chat-box'), div=document.createElement('div');
+    div.className='msg'+(own?' own':'')+(status==='queued'||status==='sending'?' pending':'');
+    if(id) { div.dataset.messageId=id; div.onclick=()=>div.classList.contains('failed')&&retryMessage(id); }
+    const n=document.createElement('span'); n.className='msg-name'; n.textContent=name;
+    const t=document.createElement('span'); t.className='msg-text'; t.textContent=text;
+    const meta=document.createElement('span'); meta.className='msg-meta';
+    meta.textContent=(time?new Date(time).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}):'')+(own&&status?' · '+statusLabel(status):'');
+    div.append(n,t,meta); box.insertBefore(div,box.firstChild);
+  }
+
+  function statusLabel(s) { return ({queued:'送信待ち',sending:'送信中',delivered:'配信済み'}[s]||s); }
+  function updateMessageStatus(id,label,cls) {
+    const div=document.querySelector('[data-message-id="'+CSS.escape(id)+'"]'); if(!div)return;
+    div.classList.remove('pending','failed'); if(cls)div.classList.add(cls);
+    const meta=div.querySelector('.msg-meta'); if(meta) meta.textContent=meta.textContent.split(' · ')[0]+' · '+label;
+  }
+
+  function addSystemLog(text) {
+    const box=document.getElementById('chat-box'), div=document.createElement('div');
+    div.className='sys-msg'; div.textContent=text; box.insertBefore(div,box.firstChild);
+  }
+
+  function setConnectionState(state,label) {
+    connectionState=state; const badge=document.getElementById('connection-badge'); if(!badge)return;
+    badge.className=state; badge.textContent=label;
+    const disabled=state==='offline'; document.getElementById('msg-input').disabled=disabled;
+    document.getElementById('send-btn').disabled=disabled;
+  }
+
+  function updateStatus() {
+    const users=Object.values(roomState.users).filter(validUser);
+    document.getElementById('online-count').textContent=String(Math.max(1,users.length));
+    const list=document.getElementById('users-list'); if(list){ list.textContent='';
+      users.sort((a,b)=>a.name.localeCompare(b.name,'ja')).forEach(u=>{const row=document.createElement('div');row.className='user-row';
+        const dot=document.createElement('span');dot.className='user-dot';const name=document.createElement('span');
+        name.textContent=u.name+(u.host?' (ホスト)':'')+(u.clientId===clientId?' (自分)':'');row.append(dot,name);list.appendChild(row);}); }
+    const status=document.getElementById('room-status'); status.title=isHost?'この端末がホストです':'参加者';
+  }
+
+  function handleUnread() {
+    if(pageVisible) return; unreadCount++; document.title='('+unreadCount+') 新着メッセージ';
+    const b=document.getElementById('unread-badge'); b.style.display='block'; b.textContent='新着 '+unreadCount+'件';
+  }
+  function showLatest(){ unreadCount=0; document.title='Minimal P2P Chat'; document.getElementById('unread-badge').style.display='none'; document.getElementById('chat-box').scrollTop=0; }
+  function clearHistory(){ if(!confirm('この部屋の端末内履歴を削除しますか？'))return; roomState.messages=[];seenMessageIds.clear();saveHistory();renderHistory();addSystemLog('端末内の履歴を削除しました。'); }
+
+  document.addEventListener('visibilitychange',()=>{pageVisible=!document.hidden;if(pageVisible)showLatest();});
+  window.addEventListener('online',()=>{setConnectionState('connecting','再接続中');if(!isHost)connectToHost();});
+  window.addEventListener('offline',()=>setConnectionState('offline','オフライン'));
+  retryTimer=setInterval(retryPending,1000);
+  window.addEventListener('DOMContentLoaded',()=>{
+    document.getElementById('room-num').value=localStorage.getItem('practical-chat-room')||'';
+    document.getElementById('user-name').value=localStorage.getItem('practical-chat-name')||'';
+  });
+
+  window.addEventListener('beforeunload', () => {
+    clearInterval(retryTimer);
+    safelyDestroyPeer();
+  });
 </script>
 </body>
 </html>
